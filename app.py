@@ -9,33 +9,29 @@ import re
 import sqlite3
 import zipfile
 from dataclasses import dataclass
-from typing import Optional, Iterable
+from typing import Optional
 
 import requests
 from flask import Flask, Response, render_template_string, request, url_for
 
 # -----------------------------
-# Konfiguration
+# Konfiguration (ASCII only für HTTP Header!)
 # -----------------------------
-APP_NAME = "DWD Heizgradtage (HDD) PLZ-scharf"
-TIMEZONE_HINT = "Europe/Berlin (Hinweis: DWD-Tageswerte sind tagesbezogen; Datum bitte als YYYY-MM-DD eingeben.)"
+APP_NAME = "DWD Heizgradtage (HDD) - PLZ-scharf"
+TIMEZONE_HINT = "Europe/Berlin (DWD-Tageswerte sind tagesbezogen; Datum als YYYY-MM-DD)"
 
 DWD_BASE = "https://opendata.dwd.de/climate_environment/CDC/observations_germany/climate/daily/kl"
 DWD_RECENT_STATIONS = f"{DWD_BASE}/recent/KL_Tageswerte_Beschreibung_Stationen.txt"
 DWD_HIST_STATIONS = f"{DWD_BASE}/historical/KL_Tageswerte_Beschreibung_Stationen.txt"
 DWD_RECENT_ZIP = f"{DWD_BASE}/recent/tageswerte_KL_{{sid:05d}}_akt.zip"
-DWD_HIST_INDEX = f"{DWD_BASE}/historical/"  # HTML index with filenames like tageswerte_KL_00011_19800901_20241231_hist.zip
+DWD_HIST_INDEX = f"{DWD_BASE}/historical/"
 
-# PLZ -> Koordinaten: wir nutzen Nominatim (OpenStreetMap) ohne API-Key.
-# Tipp: Für Produktion besser eine lokale PLZ->Koordinaten Tabelle (CSV) verwenden.
+# PLZ -> Koordinaten via Nominatim (OSM) ohne API Key
 NOMINATIM_URL = "https://nominatim.openstreetmap.org/search"
 
 DB_PATH = os.environ.get("DWD_HDD_DB", "cache.sqlite3")
 HTTP_TIMEOUT = 25
 
-# -----------------------------
-# HTML (DE, Business)
-# -----------------------------
 HTML = """
 <!doctype html>
 <html lang="de">
@@ -70,17 +66,17 @@ HTML = """
       <span class="pill">PLZ → Koordinaten → nächste DWD-Station → TMK → HDD</span>
     </p>
     <p class="muted" style="margin-bottom:0;">
-      Berechnung (vereinfachte Definition): <code>HDD = max(0, Tbase − Tmean)</code><br>
-      Wir nutzen bei DWD die Spalte <b>TMK</b> (Tagesmitteltemperatur, 2m) aus dem Datensatz „daily/kl“. Datum bitte als <b>YYYY-MM-DD</b>.
+      Berechnung: <code>HDD = max(0, Tbase − Tmean)</code><br>
+      DWD: Datensatz „daily/kl“, Spalte <b>TMK</b> (Tagesmitteltemperatur, 2m). Datum: <b>YYYY-MM-DD</b>.
     </p>
   </div>
 
   <form method="get" style="margin-top:16px;">
     <div class="row">
-      <label><b>PLZ-Liste</b> <span class="muted">(eine PLZ pro Zeile oder mit Komma trennen)</span></label><br>
+      <label><b>PLZ-Liste</b> <span class="muted">(eine pro Zeile oder Komma)</span></label><br>
       <textarea name="plz_list" placeholder="z.B.&#10;10115&#10;20095&#10;80331">{{plz_list}}</textarea>
       <div class="muted small">
-        Hinweis: Für PLZ→Koordinaten verwenden wir Nominatim (OpenStreetMap). Für Produktivbetrieb: besser lokale PLZ-Koordinaten-Tabelle.
+        Hinweis: PLZ→Koordinaten via Nominatim (OpenStreetMap). Für Produktivbetrieb besser lokale PLZ-Koordinaten-Tabelle.
       </div>
     </div>
 
@@ -88,12 +84,13 @@ HTML = """
       <label><b>Datum</b> (YYYY-MM-DD)</label><br>
       <input name="day" value="{{day}}" required>
       <div class="muted small">{{tz_hint}}</div>
+      <div class="muted small">Tipp: Wenn du Fehler bekommst, nimm ein Datum 2–5 Tage in der Vergangenheit.</div>
     </div>
 
     <div class="row">
       <label><b>Basistemperatur Tbase (°C)</b></label><br>
       <input name="tbase" value="{{tbase}}" type="number" step="0.1" required>
-      <div class="muted small">Oft 18,0 °C (je nach interner Definition/Standard abweichend).</div>
+      <div class="muted small">Oft 18,0 °C (je nach Definition/Standard).</div>
     </div>
 
     <div class="btnrow">
@@ -105,7 +102,7 @@ HTML = """
   </form>
 
   {% if fatal_error %}
-    <div class="box" style="margin-top:16px;" class="bad">
+    <div class="box" style="margin-top:16px;">
       <b class="bad">Fehler:</b> {{fatal_error}}
     </div>
   {% endif %}
@@ -114,7 +111,7 @@ HTML = """
     <div class="box" style="margin-top:16px;">
       <h2 style="margin-top:0;">Ergebnisse</h2>
       <p class="muted small" style="margin-top:0;">
-        DWD-Quelle: CDC OpenData daily/kl (TMK). Stationen werden über Luftlinie (Haversine) gewählt.
+        DWD-Quelle: CDC OpenData daily/kl (TMK). Stationen per Luftlinie (Haversine).
       </p>
 
       <table>
@@ -147,24 +144,17 @@ HTML = """
         {% endfor %}
         </tbody>
       </table>
-
-      <p class="muted small" style="margin-top:12px; margin-bottom:0;">
-        Tipp: Für tägliche Automatisierung „gestern“ berechnen und Ergebnisse in DB/CSV persistieren.
-      </p>
     </div>
   {% endif %}
 </body>
 </html>
 """
 
-# -----------------------------
-# Datenmodelle
-# -----------------------------
 @dataclass
 class Station:
     sid: int
-    von: int   # yyyymmdd
-    bis: int   # yyyymmdd
+    von: int
+    bis: int
     lat: float
     lon: float
     name: str
@@ -185,9 +175,6 @@ class RowResult:
     ok: bool
     status: str
 
-# -----------------------------
-# DB Cache
-# -----------------------------
 def db() -> sqlite3.Connection:
     conn = sqlite3.connect(DB_PATH)
     conn.execute("PRAGMA journal_mode=WAL;")
@@ -201,7 +188,7 @@ def db() -> sqlite3.Connection:
         )
     """)
     conn.execute("""
-        CREATE TABLE IF NOT EXISTS station_cache(
+        CREATE TABLE IF NOT EXISTS blob_cache(
             key TEXT PRIMARY KEY,
             content BLOB,
             ts INTEGER
@@ -217,31 +204,26 @@ def db() -> sqlite3.Connection:
     return conn
 
 def cache_get(conn: sqlite3.Connection, key: str) -> Optional[bytes]:
-    cur = conn.execute("SELECT content FROM station_cache WHERE key=?", (key,))
+    cur = conn.execute("SELECT content FROM blob_cache WHERE key=?", (key,))
     row = cur.fetchone()
     return row[0] if row else None
 
 def cache_set(conn: sqlite3.Connection, key: str, content: bytes):
-    conn.execute("INSERT OR REPLACE INTO station_cache(key, content, ts) VALUES (?, ?, ?)", (key, content, int(dt.datetime.utcnow().timestamp())))
+    conn.execute("INSERT OR REPLACE INTO blob_cache(key, content, ts) VALUES (?, ?, ?)",
+                 (key, content, int(dt.datetime.utcnow().timestamp())))
     conn.commit()
 
-# -----------------------------
-# Hilfsfunktionen
-# -----------------------------
 def parse_plz_list(text: str) -> list[str]:
     raw = (text or "").replace(",", "\n").splitlines()
     plz = []
     for line in raw:
         s = "".join(ch for ch in line.strip() if ch.isdigit())
-        if not s:
-            continue
-        plz.append(s)
-    seen = set()
-    out = []
+        if s:
+            plz.append(s)
+    seen, out = set(), []
     for p in plz:
         if p not in seen:
-            out.append(p)
-            seen.add(p)
+            out.append(p); seen.add(p)
     return out
 
 def ymd_to_int(d: dt.date) -> int:
@@ -252,352 +234,264 @@ def haversine_km(lat1, lon1, lat2, lon2) -> float:
     p1, p2 = math.radians(lat1), math.radians(lat2)
     dphi = math.radians(lat2 - lat1)
     dl = math.radians(lon2 - lon1)
-    a = math.sin(dphi / 2) ** 2 + math.cos(p1) * math.cos(p2) * math.sin(dl / 2) ** 2
-    return 2 * R * math.asin(math.sqrt(a))
+    a = math.sin(dphi/2)**2 + math.cos(p1)*math.cos(p2)*math.sin(dl/2)**2
+    return 2*R*math.asin(math.sqrt(a))
 
-def http_get(url: str, params: Optional[dict] = None, headers: Optional[dict] = None) -> requests.Response:
-    h = {"User-Agent": f"{APP_NAME} (demo; contact: example@example.com)"}
-    if headers:
-        h.update(headers)
-    r = requests.get(url, params=params, headers=h, timeout=HTTP_TIMEOUT)
+def http_get(url: str, params: Optional[dict] = None) -> requests.Response:
+    headers = {"User-Agent": "dwd-hdd-app/1.0"}  # ASCII only
+    r = requests.get(url, params=params, headers=headers, timeout=HTTP_TIMEOUT)
     r.raise_for_status()
     return r
 
-# -----------------------------
-# PLZ -> Koordinaten (Nominatim)
-# -----------------------------
+def safe_int_yyyymmdd(s: str, default: int) -> int:
+    s = (s or "").strip()
+    if s.isdigit() and len(s) == 8:
+        return int(s)
+    return default
+
 def geocode_plz(plz: str) -> tuple[float, float, str]:
     conn = db()
     cur = conn.execute("SELECT lat, lon, place, ts FROM plz_cache WHERE plz=?", (plz,))
     row = cur.fetchone()
     now = int(dt.datetime.utcnow().timestamp())
-    # Cache 30 Tage
-    if row and (now - int(row[3])) < 30 * 24 * 3600:
+    if row and (now - int(row[3])) < 30*24*3600:
         return float(row[0]), float(row[1]), row[2] or ""
 
-    params = {
-        "format": "jsonv2",
-        "countrycodes": "de",
-        "postalcode": plz,
-        "addressdetails": 1,
-        "limit": 1,
-    }
+    params = {"format":"jsonv2","countrycodes":"de","postalcode":plz,"addressdetails":1,"limit":1}
     r = http_get(NOMINATIM_URL, params=params)
     data = r.json()
     if not data:
-        # Fallback: query string
-        params2 = {"format": "jsonv2", "q": f"{plz} Deutschland", "limit": 1}
-        r2 = http_get(NOMINATIM_URL, params=params2)
-        data = r2.json()
+        params2 = {"format":"jsonv2","q":f"{plz} Deutschland","limit":1}
+        data = http_get(NOMINATIM_URL, params=params2).json()
         if not data:
-            raise ValueError("PLZ konnte nicht geocodiert werden (keine Koordinaten gefunden).")
+            raise ValueError("PLZ konnte nicht geocodiert werden (keine Koordinaten).")
 
     item = data[0]
-    lat = float(item["lat"])
-    lon = float(item["lon"])
-    # nice place label
+    lat, lon = float(item["lat"]), float(item["lon"])
     addr = item.get("address") or {}
     place = addr.get("city") or addr.get("town") or addr.get("village") or addr.get("county") or ""
     state = addr.get("state") or ""
-    label = f"{place}, {state}".strip(", ").strip() if (place or state) else (item.get("display_name") or "")
-
-    conn.execute(
-        "INSERT OR REPLACE INTO plz_cache(plz, lat, lon, place, ts) VALUES (?, ?, ?, ?, ?)",
-        (plz, lat, lon, label, now),
-    )
+    label = (f"{place}, {state}".strip(", ").strip()) if (place or state) else (item.get("display_name") or "")
+    conn.execute("INSERT OR REPLACE INTO plz_cache(plz, lat, lon, place, ts) VALUES (?,?,?,?,?)",
+                 (plz, lat, lon, label, now))
     conn.commit()
     return lat, lon, label
 
-# -----------------------------
-# DWD Stationen laden (cached)
-# -----------------------------
 def load_dwd_stations() -> list[Station]:
-    """
-    Lädt Stationsliste für daily/kl. Wird im SQLite cache gespeichert.
-    """
     conn = db()
-    key = "dwd_stations_daily_kl_v1"
+    key = "dwd_stations_daily_kl_v2"
     cached = cache_get(conn, key)
     if cached:
         try:
-            obj = cached.decode("utf-8")
-            items = obj.splitlines()
-            stations = []
-            for line in items:
+            out=[]
+            for line in cached.decode("utf-8").splitlines():
                 sid, von, bis, lat, lon, name = line.split("\t")
-                stations.append(Station(int(sid), int(von), int(bis), float(lat), float(lon), name))
-            return stations
+                out.append(Station(int(sid), int(von), int(bis), float(lat), float(lon), name))
+            return out
         except Exception:
             pass
 
-    # Prefer recent list (aktuell), fallback historical list
     try:
         txt = http_get(DWD_RECENT_STATIONS).text
     except Exception:
         txt = http_get(DWD_HIST_STATIONS).text
 
-    lines = txt.splitlines()
-    stations: list[Station] = []
-    # skip header
-    for line in lines[1:]:
+    stations=[]
+    for line in txt.splitlines()[1:]:
         if not line.strip():
             continue
-        parts = line.split()
+        parts=line.split()
         if len(parts) < 7:
             continue
-        sid = int(parts[0])
-        von = int(parts[1])
-        bis = int(parts[2])
-        lat = float(parts[4])
-        lon = float(parts[5])
-        name = parts[6]
+        sid=int(parts[0])
+        von=safe_int_yyyymmdd(parts[1], 0)
+        bis=safe_int_yyyymmdd(parts[2], 99991231)
+        lat=float(parts[4]); lon=float(parts[5]); name=parts[6]
         stations.append(Station(sid, von, bis, lat, lon, name))
 
-    # store compactly
-    payload_lines = [f"{s.sid}\t{s.von}\t{s.bis}\t{s.lat}\t{s.lon}\t{s.name}" for s in stations]
-    cache_set(conn, key, ("\n".join(payload_lines)).encode("utf-8"))
+    payload="\n".join([f"{s.sid}\t{s.von}\t{s.bis}\t{s.lat}\t{s.lon}\t{s.name}" for s in stations]).encode("utf-8")
+    cache_set(conn, key, payload)
     return stations
 
 def nearest_station_for_date(lat: float, lon: float, day_int: int, stations: list[Station]) -> tuple[Station, float]:
-    best = None
-    best_d = 1e18
+    best=None; best_d=1e18
     for s in stations:
-        if not (s.von <= day_int <= s.bis):
+        if s.von and day_int < s.von: 
             continue
-        d = haversine_km(lat, lon, s.lat, s.lon)
+        if s.bis and day_int > s.bis: 
+            continue
+        d=haversine_km(lat, lon, s.lat, s.lon)
         if d < best_d:
-            best_d = d
-            best = s
+            best_d=d; best=s
     if not best:
-        # fallback without date filter
         for s in stations:
-            d = haversine_km(lat, lon, s.lat, s.lon)
+            d=haversine_km(lat, lon, s.lat, s.lon)
             if d < best_d:
-                best_d = d
-                best = s
+                best_d=d; best=s
     if not best:
         raise ValueError("Keine DWD-Station gefunden.")
     return best, best_d
 
-# -----------------------------
-# DWD Daten lesen: recent ZIP oder historical ZIP
-# -----------------------------
 def try_fetch_recent_zip(sid: int) -> Optional[bytes]:
-    url = DWD_RECENT_ZIP.format(sid=sid)
     try:
-        r = http_get(url)
-        return r.content
+        return http_get(DWD_RECENT_ZIP.format(sid=sid)).content
     except Exception:
         return None
 
 def resolve_historical_zip_name(sid: int) -> Optional[str]:
-    """
-    Findet den historischen ZIP-Dateinamen für eine Station via HTML-Index.
-    Ergebnis wird in SQLite gecached.
-    """
-    conn = db()
-    cur = conn.execute("SELECT zip_name, ts FROM hist_zip_map WHERE sid=?", (sid,))
-    row = cur.fetchone()
-    now = int(dt.datetime.utcnow().timestamp())
-    if row and (now - int(row[1])) < 90 * 24 * 3600:
+    conn=db()
+    row=conn.execute("SELECT zip_name, ts FROM hist_zip_map WHERE sid=?", (sid,)).fetchone()
+    now=int(dt.datetime.utcnow().timestamp())
+    if row and (now-int(row[1])) < 90*24*3600:
         return row[0]
-
-    # load index html (can be large)
-    html = http_get(DWD_HIST_INDEX).text
-    # filenames like tageswerte_KL_00011_19800901_20241231_hist.zip
-    pattern = re.compile(rf"tageswerte_KL_{sid:05d}_[0-9]{{8}}_[0-9]{{8}}_hist\.zip")
-    m = pattern.search(html)
+    html=http_get(DWD_HIST_INDEX).text
+    m=re.search(rf"tageswerte_KL_{sid:05d}_[0-9]{{8}}_[0-9]{{8}}_hist\.zip", html)
     if not m:
         return None
-    name = m.group(0)
-    conn.execute("INSERT OR REPLACE INTO hist_zip_map(sid, zip_name, ts) VALUES (?, ?, ?)", (sid, name, now))
+    name=m.group(0)
+    conn.execute("INSERT OR REPLACE INTO hist_zip_map(sid, zip_name, ts) VALUES (?,?,?)", (sid, name, now))
     conn.commit()
     return name
 
 def try_fetch_historical_zip(sid: int) -> Optional[bytes]:
-    name = resolve_historical_zip_name(sid)
+    name=resolve_historical_zip_name(sid)
     if not name:
         return None
-    url = f"{DWD_HIST_INDEX}{name}"
     try:
-        r = http_get(url)
-        return r.content
+        return http_get(f"{DWD_HIST_INDEX}{name}").content
     except Exception:
         return None
 
 def read_tmk_from_zip(zip_bytes: bytes, yyyymmdd: int) -> float:
     with zipfile.ZipFile(io.BytesIO(zip_bytes)) as z:
+        prod =_toggle = None
         prod = next((n for n in z.namelist() if n.lower().startswith("produkt_") and n.lower().endswith(".txt")), None)
         if not prod:
             raise ValueError("ZIP enthält keine produkt_*.txt Datei.")
-        raw = z.read(prod)
-        # DWD files often latin-1
-        text = raw.decode("latin-1", errors="replace").splitlines()
+        raw=z.read(prod)
+        lines=raw.decode("latin-1", errors="replace").splitlines()
 
-    header = text[0].split(";")
-    try:
-        idx_date = header.index("MESS_DATUM")
-        idx_tmk = header.index("TMK")
-    except ValueError:
+    header=lines[0].split(";")
+    if "MESS_DATUM" not in header or "TMK" not in header:
         raise ValueError("Spalten MESS_DATUM/TMK nicht gefunden.")
-    target = str(yyyymmdd)
+    idx_date=header.index("MESS_DATUM"); idx_tmk=header.index("TMK")
+    target=str(yyyymmdd)
 
-    for line in text[1:]:
-        cols = line.split(";")
+    for line in lines[1:]:
+        cols=line.split(";")
         if len(cols) <= max(idx_date, idx_tmk):
             continue
-        if cols[idx_date] == target:
-            val = cols[idx_tmk].strip()
-            if not val or val.startswith("-999"):
-                raise ValueError("TMK fehlt/ungültig (-999).")
-            return float(val)
-    raise ValueError("Kein Datensatz für dieses Datum in der Station-Datei.")
+        if cols[idx_date].strip() != target:
+            continue
+        v=cols[idx_tmk].strip()
+        if (not v) or v.startswith("-999") or v.startswith("-"):
+            raise ValueError("DWD: TMK nicht verfügbar für dieses Datum.")
+        return float(v)
+
+    raise ValueError("DWD: kein Datensatz für dieses Datum (Verzögerung/Station offline).")
 
 def compute_hdd(tmean: float, tbase: float) -> float:
     return max(0.0, round(tbase - tmean, 2))
 
-# -----------------------------
-# Flask App
-# -----------------------------
 app = Flask(__name__)
 
 def compute_for_plz(plz: str, day: dt.date, tbase: float, stations: list[Station]) -> RowResult:
     try:
         lat, lon, place = geocode_plz(plz)
         day_int = ymd_to_int(day)
-
         st, dist = nearest_station_for_date(lat, lon, day_int, stations)
 
-        zip_bytes = try_fetch_recent_zip(st.sid)
-        source = "recent"
+        zip_bytes = try_fetch_recent_zip(st.sid); source="recent"
         if not zip_bytes:
-            zip_bytes = try_fetch_historical_zip(st.sid)
-            source = "historical"
+            zip_bytes = try_fetch_historical_zip(st.sid); source="historical"
         if not zip_bytes:
-            raise ValueError("DWD ZIP nicht abrufbar (weder recent noch historical).")
+            raise ValueError("DWD ZIP nicht abrufbar (recent/historical).")
 
         tmean = read_tmk_from_zip(zip_bytes, day_int)
         hdd = compute_hdd(tmean, tbase)
 
-        return RowResult(
-            plz=plz,
-            lat=f"{lat:.5f}",
-            lon=f"{lon:.5f}",
-            place=place or "—",
-            station_id=str(st.sid),
-            station_name=f"{st.name} ({source})",
-            dist_km=f"{dist:.1f}",
-            day=day.isoformat(),
-            tmean=f"{tmean:.2f}",
-            tbase=f"{tbase:.2f}",
-            hdd=f"{hdd:.2f}",
-            ok=True,
-            status="OK",
-        )
+        return RowResult(plz, f"{lat:.5f}", f"{lon:.5f}", place or "—",
+                         str(st.sid), f"{st.name} ({source})", f"{dist:.1f}",
+                         day.isoformat(), f"{tmean:.2f}", f"{tbase:.2f}", f"{hdd:.2f}",
+                         True, "OK")
     except Exception as e:
-        return RowResult(
-            plz=plz,
-            lat="—",
-            lon="—",
-            place="—",
-            station_id="—",
-            station_name="—",
-            dist_km="—",
-            day=day.isoformat(),
-            tmean="—",
-            tbase=f"{tbase:.2f}",
-            hdd="—",
-            ok=False,
-            status=str(e),
-        )
+        return RowResult(plz, "—", "—", "—", "—", "—", "—",
+                         day.isoformat(), "—", f"{tbase:.2f}", "—",
+                         False, str(e))
 
 @app.route("/", methods=["GET"])
 def index():
-    plz_list_text = (request.args.get("plz_list") or "").strip()
-    day_str = (request.args.get("day") or str(dt.date.today())).strip()
-    tbase_str = (request.args.get("tbase") or "18.0").strip()
+    plz_list_text=(request.args.get("plz_list") or "").strip()
+    default_day=(dt.date.today()-dt.timedelta(days=3)).isoformat()
+    day_str=(request.args.get("day") or default_day).strip()
+    tbase_str=(request.args.get("tbase") or "18.0").strip()
 
-    rows: list[RowResult] = []
-    fatal_error: Optional[str] = None
+    rows=[]
+    fatal_error=None
 
     if plz_list_text:
         try:
-            try:
-                day = dt.date.fromisoformat(day_str)
-            except Exception:
-                raise ValueError("Datum muss im Format YYYY-MM-DD sein.")
-            try:
-                tbase = float(tbase_str)
-            except Exception:
-                raise ValueError("Tbase muss eine Zahl sein (z.B. 18.0).")
+            day=dt.date.fromisoformat(day_str)
+        except Exception:
+            fatal_error="Datum muss im Format YYYY-MM-DD sein."
+            day=dt.date.today()
 
-            plz_list = parse_plz_list(plz_list_text)
+        try:
+            tbase=float(tbase_str.replace(",", "."))
+        except Exception:
+            fatal_error=fatal_error or "Tbase muss eine Zahl sein (z.B. 18.0)."
+            tbase=18.0
+
+        if not fatal_error:
+            plz_list=parse_plz_list(plz_list_text)
             if not plz_list:
-                raise ValueError("Bitte mindestens eine PLZ angeben.")
+                fatal_error="Bitte mindestens eine PLZ angeben."
+            else:
+                stations=load_dwd_stations()
+                for plz in plz_list:
+                    rows.append(compute_for_plz(plz, day, tbase, stations))
 
-            stations = load_dwd_stations()
-            for plz in plz_list:
-                rows.append(compute_for_plz(plz, day, tbase, stations))
-
-        except Exception as e:
-            fatal_error = str(e)
-
-    export_url = None
+    export_url=None
     if rows and not fatal_error:
-        export_url = url_for("export_csv", plz_list=plz_list_text, day=day_str, tbase=tbase_str)
+        export_url=url_for("export_csv", plz_list=plz_list_text, day=day_str, tbase=tbase_str)
 
-    return render_template_string(
-        HTML,
-        title=APP_NAME,
-        tz_hint=TIMEZONE_HINT,
-        plz_list=plz_list_text,
-        day=day_str,
-        tbase=tbase_str,
-        rows=rows,
-        fatal_error=fatal_error,
-        export_url=export_url,
-    )
+    return render_template_string(HTML, title=APP_NAME, tz_hint=TIMEZONE_HINT,
+                                  plz_list=plz_list_text, day=day_str, tbase=tbase_str,
+                                  rows=rows, fatal_error=fatal_error, export_url=export_url)
 
 @app.route("/export.csv", methods=["GET"])
 def export_csv():
-    plz_list_text = (request.args.get("plz_list") or "").strip()
-    day_str = (request.args.get("day") or "").strip()
-    tbase_str = (request.args.get("tbase") or "18.0").strip()
+    plz_list_text=(request.args.get("plz_list") or "").strip()
+    day_str=(request.args.get("day") or "").strip()
+    tbase_str=(request.args.get("tbase") or "18.0").strip()
 
     try:
-        day = dt.date.fromisoformat(day_str)
+        day=dt.date.fromisoformat(day_str)
     except Exception:
         return Response("Invalid day. Use YYYY-MM-DD.", status=400)
 
     try:
-        tbase = float(tbase_str)
+        tbase=float(tbase_str.replace(",", "."))
     except Exception:
         return Response("Invalid tbase.", status=400)
 
-    plz_list = parse_plz_list(plz_list_text)
+    plz_list=parse_plz_list(plz_list_text)
     if not plz_list:
         return Response("No PLZ.", status=400)
 
-    stations = load_dwd_stations()
+    stations=load_dwd_stations()
 
-    output = io.StringIO()
-    writer = csv.writer(output, delimiter=";")
-    writer.writerow(["plz", "lat", "lon", "place", "station_id", "station_name", "dist_km", "day", "tmk_tmean_c", "tbase_c", "hdd", "status"])
-
+    output=io.StringIO()
+    w=csv.writer(output, delimiter=";")
+    w.writerow(["plz","lat","lon","place","station_id","station_name","dist_km","day","tmk_tmean_c","tbase_c","hdd","status"])
     for plz in plz_list:
-        r = compute_for_plz(plz, day, tbase, stations)
-        writer.writerow([r.plz, r.lat, r.lon, r.place, r.station_id, r.station_name, r.dist_km, r.day, r.tmean, r.tbase, r.hdd, r.status])
+        r=compute_for_plz(plz, day, tbase, stations)
+        w.writerow([r.plz,r.lat,r.lon,r.place,r.station_id,r.station_name,r.dist_km,r.day,r.tmean,r.tbase,r.hdd,r.status])
 
-    csv_bytes = output.getvalue().encode("utf-8")
-    filename = f"hdd_dwd_{day.isoformat()}.csv"
-    return Response(
-        csv_bytes,
-        mimetype="text/csv; charset=utf-8",
-        headers={"Content-Disposition": f"attachment; filename={filename}"},
-    )
+    data=output.getvalue().encode("utf-8")
+    return Response(data, mimetype="text/csv; charset=utf-8",
+                    headers={"Content-Disposition": f"attachment; filename=hdd_dwd_{day.isoformat()}.csv"})
 
 if __name__ == "__main__":
-    # локальный запуск: http://127.0.0.1:5000
-    import os
-    port=int(os.environ.get("PORT",5000))
+    port=int(os.environ.get("PORT","5000"))
     app.run(host="0.0.0.0", port=port)
