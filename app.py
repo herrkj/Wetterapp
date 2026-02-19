@@ -17,7 +17,7 @@ from flask import Flask, Response, render_template_string, request, url_for
 # -----------------------------
 # Konfiguration
 # -----------------------------
-APP_NAME = "DWD Heizgradtage (HDD) – PLZ-scharf"
+APP_NAME = "DWD Heizgradtage (HDD) PLZ-scharf"
 TIMEZONE_HINT = "Europe/Berlin (Hinweis: DWD-Tageswerte sind tagesbezogen; Datum bitte als YYYY-MM-DD eingeben.)"
 
 DWD_BASE = "https://opendata.dwd.de/climate_environment/CDC/observations_germany/climate/daily/kl"
