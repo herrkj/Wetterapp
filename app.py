@@ -242,11 +242,11 @@ def geocode_plz(plz: str) -> Tuple[float, float, str]:
     return lat, lon, label
 
 def load_stations() -> List[Station]:
-    key = "stations_daily_kl_v1"
+    key = "stations_daily_kl_v2"
     cached = cache_get(key)
     if cached:
         try:
-            out = []
+            out: List[Station] = []
             for line in cached.decode("utf-8").splitlines():
                 sid, name, lat, lon = line.split("\t")
                 out.append(Station(int(sid), name, float(lat), float(lon)))
@@ -255,34 +255,53 @@ def load_stations() -> List[Station]:
         except Exception:
             pass
 
-    txt = None
+    # Load station description file from DWD (fixed-width format)
+    resp_bytes: Optional[bytes] = None
+    last_err: Optional[str] = None
     for url in (DWD_STATIONS_RECENT, DWD_STATIONS_HIST):
         try:
-            txt = http_get(url).text
+            resp_bytes = http_get(url).content
             break
-        except Exception:
+        except Exception as e:
+            last_err = str(e)
             continue
-    if not txt:
-        raise ValueError("DWD Stationsliste nicht verfügbar.")
+    if not resp_bytes:
+        raise ValueError(f"DWD Stationsliste nicht verfügbar. Letzter Fehler: {last_err}")
 
+    # Defensive: sometimes servers return an HTML error page
+    head = resp_bytes[:200].lstrip().lower()
+    if head.startswith(b"<") and b"html" in head:
+        raise ValueError("DWD Stationsliste konnte nicht gelesen werden (HTML statt TXT).")
+
+    txt = resp_bytes.decode("latin-1", errors="replace")
+
+    # DWD fixed-width indices (split positions): 5,14,23,38,50,60,101
+    # station_id | von | bis | hoehe | lat | lon | name | bundesland
     stations: List[Station] = []
-    for line in txt.splitlines():
-        if not line.strip() or len(line) < 120:
+    lines = txt.splitlines()
+
+    # Skip non-data header lines: keep only those starting with 5 digits
+    for line in lines:
+        if not line.strip():
             continue
         sid_raw = line[0:5].strip()
         if not sid_raw.isdigit():
             continue
         try:
             sid = int(sid_raw)
-            name = line[61:102].strip()
-            lat = float(line[102:110].strip())
-            lon = float(line[110:119].strip())
-            stations.append(Station(sid, name, lat, lon))
+            # These slices follow the known column breaks
+            lat_s = line[38:50].strip()
+            lon_s = line[50:60].strip()
+            name = line[60:101].strip() if len(line) >= 101 else line[60:].strip()
+            lat = float(lat_s)
+            lon = float(lon_s)
+            if name:
+                stations.append(Station(sid, name, lat, lon))
         except Exception:
             continue
 
     if not stations:
-        raise ValueError("Keine Stationen aus DWD Liste geparst.")
+        raise ValueError("Keine Stationen aus DWD Liste geparst. (Format/Download prüfen)")
 
     payload = "\n".join([f"{s.sid}\t{s.name}\t{s.lat}\t{s.lon}" for s in stations]).encode("utf-8")
     cache_set(key, payload)
